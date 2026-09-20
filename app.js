@@ -2,6 +2,10 @@
   'use strict';
 
   const STORAGE_KEY = 'hanhkiem_manager_v1';
+  // Dữ liệu dùng chung trên Firebase Realtime Database.
+  const FIREBASE_ROOT_PATH = '/';
+  let cloudReady = false;
+  let databaseRef = null;
   const VERSION = 4;
   const FIXED_MAX_SCORE = 10;
   const DEFAULT_RULES = [
@@ -145,28 +149,86 @@
     return memoryStorage;
   }
 
-  function loadData() {
+  function loadLocalData() {
     try {
       const raw = getStorage().getItem(STORAGE_KEY);
-      if (!raw) return defaultData();
-      return normalizeData(JSON.parse(raw));
+      return raw ? normalizeData(JSON.parse(raw)) : null;
     } catch (err) {
-      console.error('Không thể đọc dữ liệu lưu cục bộ:', err);
-      showToast('Dữ liệu lưu cục bộ có lỗi. Hệ thống đã tạo dữ liệu mặc định.', 'warning');
-      return defaultData();
+      console.error('Không thể đọc dữ liệu cục bộ:', err);
+      return null;
     }
   }
 
-  function saveData() {
+  function initFirebaseDatabase() {
+    if (!window.firebase || !window.firebaseConfig) {
+      throw new Error('Thiếu Firebase SDK hoặc firebaseConfig.');
+    }
+    if (!firebase.apps.length) {
+      firebase.initializeApp(window.firebaseConfig);
+    }
+    databaseRef = firebase.database().ref(FIREBASE_ROOT_PATH);
+    return databaseRef;
+  }
+
+  function watchFirebaseChanges() {
+    if (!databaseRef) return;
+    databaseRef.on('value', snapshot => {
+      const remote = snapshot.val();
+      if (!remote || typeof remote !== 'object') return;
+
+      const normalized = normalizeData(remote);
+      const changed = JSON.stringify(normalized) !== JSON.stringify(state.data);
+      cloudReady = true;
+      getStorage().setItem(STORAGE_KEY, JSON.stringify(normalized));
+
+      if (changed && state.data) {
+        state.data = normalized;
+        $('#loginSiteName').textContent = state.data.settings.siteName;
+        if (state.currentUser) {
+          renderAppShell();
+        }
+      }
+    }, err => {
+      console.error('Firebase listener error:', err);
+      cloudReady = false;
+    });
+  }
+
+  async function loadData() {
+    const local = loadLocalData();
+    try {
+      initFirebaseDatabase();
+      const snapshot = await databaseRef.once('value');
+      const remote = snapshot.val();
+      if (!remote || typeof remote !== 'object') throw new Error('Firebase đang trống.');
+      const data = normalizeData(remote);
+      cloudReady = true;
+      getStorage().setItem(STORAGE_KEY, JSON.stringify(data));
+      watchFirebaseChanges();
+      return data;
+    } catch (err) {
+      console.warn('Không kết nối được Firebase, sử dụng dữ liệu cục bộ:', err);
+      cloudReady = false;
+      return local || defaultData();
+    }
+  }
+
+  async function saveData() {
     try {
       state.data.version = VERSION;
       state.data.settings.maxScore = FIXED_MAX_SCORE;
       state.data.students.forEach(s => { s.score = clampScore(s.score); });
-      getStorage().setItem(STORAGE_KEY, JSON.stringify(state.data));
+      const serialized = JSON.stringify(state.data);
+      getStorage().setItem(STORAGE_KEY, serialized);
+
+      if (!databaseRef) initFirebaseDatabase();
+      await databaseRef.set(state.data);
+      cloudReady = true;
       return true;
     } catch (err) {
       console.error(err);
-      showToast('Không thể lưu dữ liệu vào trình duyệt. Hãy kiểm tra dung lượng trình duyệt.', 'error');
+      cloudReady = false;
+      showToast('Không thể đồng bộ dữ liệu lên Firebase. Dữ liệu vẫn được lưu tạm trên thiết bị.', 'error');
       return false;
     }
   }
@@ -536,7 +598,7 @@
                 <div class="actions" style="margin-top:12px;"><label class="btn btn-secondary" for="teacherAvatarInput">📷 Chọn ảnh</label><input id="teacherAvatarInput" type="file" accept="image/*" hidden><button class="btn btn-danger" type="button" data-action="remove-avatar">Xóa ảnh</button></div>
               </div>
             </div>
-            <div class="notice info" style="margin-top:16px;">Nên dùng ảnh vuông. Hệ thống sẽ tự cắt giữa ảnh và nén nhẹ để tiết kiệm localStorage.</div>
+            <div class="notice info" style="margin-top:16px;">Nên dùng ảnh vuông. Hệ thống sẽ tự cắt giữa ảnh và nén nhẹ để tiết kiệm dung lượng dữ liệu.</div>
           </div>
         </div>
         <div class="card">
@@ -687,7 +749,7 @@
       <div class="grid grid-2">
         <div class="card"><div class="card-header"><div><h3 class="card-title">Thông tin website</h3><div class="card-subtitle">Cấu hình hiển thị cơ bản</div></div></div><div class="card-body"><form id="siteSettingsForm" class="stack-form" style="margin-top:0;"><label>Tên website<input name="siteName" value="${escapeHtml(s.siteName)}" required></label><label>Điểm khởi đầu<input value="10" disabled></label><label>Điểm tối đa<input value="10" disabled></label><div class="notice info">Điểm tối đa và điểm khởi đầu được cố định là 10, không thể thay đổi.</div><button class="btn btn-primary" type="submit">Lưu thông tin</button></form></div></div>
         <div class="card"><div class="card-header"><div><h3 class="card-title">Tài khoản Admin</h3><div class="card-subtitle">Thay đổi tài khoản và mật khẩu quản trị</div></div></div><div class="card-body"><form id="adminSettingsForm" class="stack-form" style="margin-top:0;"><label>Tài khoản Admin<input name="username" value="${escapeHtml(state.data.admin.username)}" required></label><label>Mật khẩu mới<input type="password" name="password" placeholder="Để trống để giữ nguyên"></label><label>Nhập lại mật khẩu<input type="password" name="password2" placeholder="Để trống nếu không đổi"></label><button class="btn btn-primary" type="submit">Lưu tài khoản</button></form></div></div>
-        <div class="card"><div class="card-header"><div><h3 class="card-title">Sao lưu & khôi phục</h3><div class="card-subtitle">Dữ liệu được lưu bằng localStorage</div></div></div><div class="card-body"><div class="toolbar"><button class="btn btn-secondary" data-action="backup">⬇️ Sao lưu JSON</button><label class="btn btn-secondary" style="display:inline-flex;cursor:pointer;">⬆️ Khôi phục JSON<input id="restoreFile" type="file" accept="application/json,.json" hidden></label></div><div class="notice warning" style="margin-top:14px;">Khôi phục sẽ thay thế toàn bộ dữ liệu hiện tại trong trình duyệt này.</div></div></div>
+        <div class="card"><div class="card-header"><div><h3 class="card-title">Sao lưu & khôi phục</h3><div class="card-subtitle">Dữ liệu được lưu trên Firebase</div></div></div><div class="card-body"><div class="toolbar"><button class="btn btn-secondary" data-action="backup">⬇️ Sao lưu JSON</button><label class="btn btn-secondary" style="display:inline-flex;cursor:pointer;">⬆️ Khôi phục JSON<input id="restoreFile" type="file" accept="application/json,.json" hidden></label></div><div class="notice warning" style="margin-top:14px;">Khôi phục sẽ thay thế toàn bộ dữ liệu hiện tại trong Firebase và các thiết bị đang dùng chung.</div></div></div>
         <div class="card"><div class="card-header"><div><h3 class="card-title">Thông tin dữ liệu</h3><div class="card-subtitle">Tổng quan cơ sở dữ liệu cục bộ</div></div></div><div class="card-body"><div class="kpi-row"><div class="kpi-mini"><span>Học sinh</span><strong>${state.data.students.length}</strong></div><div class="kpi-mini"><span>Giáo viên</span><strong>${state.data.teachers.length}</strong></div><div class="kpi-mini"><span>Lịch sử</span><strong>${state.data.history.length}</strong></div></div><div class="notice danger" style="margin-top:12px;">Nút xóa toàn bộ dữ liệu không được đặt trong giao diện để tránh mất dữ liệu ngoài ý muốn.</div></div></div>
       </div>`;
     $('#siteSettingsForm').addEventListener('submit', e => { e.preventDefault(); const fd = new FormData(e.currentTarget); const siteName = String(fd.get('siteName')||'').trim(); if (!siteName) return showToast('Tên website không được để trống.', 'error'); state.data.settings.siteName = siteName; saveData(); renderAppShell(); showToast('Đã cập nhật thông tin website.'); });
@@ -1340,15 +1402,15 @@
     document.body.classList.remove('mobile-menu-open');
   }
 
-  function init(){
+  async function init(){
     try{
-      state.data=normalizeData(loadData());
+      state.data=normalizeData(await loadData());
       $('#loginSiteName').textContent=state.data.settings.siteName;
       setupEventDelegation();
       $('#appErrorReload').addEventListener('click',()=>window.location.reload());
       $('#loginForm').addEventListener('submit',e=>{ e.preventDefault(); const ok=login($('#loginUsername').value,$('#loginPassword').value); if(!ok && state.currentUser===null) {setLoginMessage('Sai tài khoản hoặc mật khẩu.'); return;} setLoginMessage(''); renderAppShell(); });
       $('#loginUsername').focus();
-      window.addEventListener('error', ev => { console.error(ev.error||ev.message); showAppError('Có lỗi JavaScript xảy ra. Dữ liệu hiện tại vẫn được giữ trong localStorage.'); });
+      window.addEventListener('error', ev => { console.error(ev.error||ev.message); showAppError('Có lỗi JavaScript xảy ra. Dữ liệu hiện tại vẫn được lưu tạm trên thiết bị.'); });
       window.addEventListener('unhandledrejection', ev => { console.error(ev.reason); showAppError('Có lỗi không mong muốn. Bạn có thể tải lại trang để tiếp tục.'); });
     }catch(err){ console.error(err); showAppError('Không thể khởi tạo ứng dụng. Hãy tải lại trang.'); }
   }
